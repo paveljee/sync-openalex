@@ -158,4 +158,105 @@ yet we will not do that and will do our own checks to be sure.
 so we only tick fully_downloaded when we see that the actually downloaded files
 match what we expected to get from this partition based on the aws ls fetch we pre-run.
 
+asking ai below to interpret.
+using:
+```
+model = "gpt-5.4"
+model_reasoning_effort = "xhigh"
+web_search = "disabled"
+network_access = false
+```
+via codex vs code extension
+openai.chatgpt
+Version
+26.325.31654
+under sandboxed lima.
+
 ## ai section - how it understood the spec
+
+This is how I currently understand the requested change.
+
+1. High-level behavior change
+- Replace the current manifest-first, whole-entity sync flow with a progress-file-driven, partition-by-partition sync flow.
+- The hardcoded entity list remains the owned inventory of entities and also defines output ordering.
+- The script should now own the inventory of partitions in `sync_progress.json`, while keeping already completed older partitions intact and only syncing partitions that are not yet marked complete.
+- The correctness gate is no longer "manifest matches, then sync the whole entity"; it is now "one partition sync completes, then that partition passes our own integrity check against the remote inventory captured for this run".
+
+2. Progress file shape
+- Add a progress file path, defaulting to `Path("./sync_progress.json")`.
+- Top level shape is:
+
+```json
+{
+  "download_status": {
+    "<entity-key>": {
+      "local": {},
+      "remote": {}
+    }
+  }
+}
+```
+
+- Entity keys in `download_status` must follow the hardcoded entity order.
+- `partition_type` is always the literal string `"updated_date"`.
+- My interpretation is that partition keys inside `partitions` should be the bare date value, for example `2024-01-15`, because `partition_type` already stores the `"updated_date"` label.
+- My interpretation is that `listing` should be an ordered mapping keyed by filename, with each value being the flat metadata dict for that file and also including `filename` inside the dict.
+
+3. What gets scanned each run
+- First, load any existing `sync_progress.json`. If it does not exist yet, initialize an empty structure and continue.
+- Then do a full local scan under `DEFAULT_LOCAL_ROOT`, limited to the hardcoded entities, and rebuild the `local` tree from disk.
+- Then do one broad remote inventory fetch under `DEFAULT_REMOTE_ROOT` and rebuild the `remote` tree from that fetch.
+- Both local and remote summaries are descriptive snapshots of what was seen during the current run.
+- `last_calculated` must be an accurate ISO timestamp for when the corresponding inventory snapshot was computed.
+- The remote tree mirrors the local tree structurally, except remote does not use `fully_downloaded` or `timestamp_fully_downloaded`.
+
+4. Per-file metadata
+- Each file entry must contain at least:
+- `filename`
+- `last_modified`
+- `hash_sum`
+- Any other metadata returned by AWS for that file should also be preserved in the same flat dict.
+- For local files, use the same normalized metadata shape where possible, with the local hash calculated by the script so it can be compared directly with the remote hash field.
+
+5. Meaning of `fully_downloaded`
+- Partition level:
+- Default is `false`.
+- It becomes `true` only after a partition-scoped sync finishes and that exact partition passes integrity verification during the same run.
+- The integrity rule is strict: the remote and local partition must have the same number of part files, and every expected part file must have the same hash on both sides.
+- When that passes, set `timestamp_fully_downloaded` to the partition's current `last_calculated`.
+- After that, the partition is frozen: future runs keep its stored `fully_downloaded=true` state and do not sync it again.
+- This frozen behavior is intentional even if the current remote listing for that older partition later changes, because the spec explicitly wants older partitions kept intact locally.
+- Entity level:
+- My interpretation is that entity summary `fully_downloaded` is a rollup over partition states, not its own independent sticky state.
+- In other words, it should be `true` when every partition currently tracked for that entity is marked `fully_downloaded=true`, and `false` otherwise.
+- My interpretation is that entity summary `timestamp_fully_downloaded` should be the entity summary's current `last_calculated` when that rollup is true, and empty or null otherwise.
+
+6. How remote-only new partitions are represented
+- If the remote inventory contains a partition that is not present locally yet, the script still needs a local progress entry for that partition so it can be scheduled for download.
+- My interpretation is that after the remote fetch, the local tree should be augmented with any missing remote partition keys, initialized as not fully downloaded, with an empty local listing until the partition is actually synced.
+
+7. Sync loop
+- There is no entity-wide or global `aws s3 sync` anymore.
+- After the initial local and remote inventory rebuild, the script iterates:
+- entities in hardcoded order
+- partitions from oldest to newest
+- It skips any partition already marked `fully_downloaded=true` in the persisted local progress state.
+- For every remaining partition, it runs exactly one partition-scoped `aws s3 sync`.
+- The partition-scoped sync uses these flags:
+- `--no-sign-request`
+- `--no-progress`
+- `--checksum-mode ENABLED`
+- `--delete`
+
+8. Transaction boundary
+- A partition is the unit of transaction.
+- After a partition sync completes, the script immediately re-checks that one partition against the remote inventory already captured for this run.
+- If the check passes, mark it fully downloaded and persist that status.
+- If the check fails, print a granular error and exit with status 1.
+- Therefore a partition is either fully verified and marked within one run, or it is left unmarked.
+
+9. Assumptions I am making from the spec before implementation
+- The existing manifest download and manifest checksum workflow is removed from the main control flow. It is not mentioned in the new progress format and is no longer the thing that gates syncing.
+- Scanning should ignore entity directories that are not in the hardcoded entity list, because the entity inventory is explicitly owned by that list.
+- Even though the structure bullets only show `last_calculated` at the entity summary level, I am interpreting partition summaries as also needing `last_calculated`, because the spec says partition `timestamp_fully_downloaded` should be set to the current `last_calculated`.
+- The single broad remote fetch must provide enough metadata to populate the remote listing and later compare hashes. If plain `aws s3 ls` cannot supply hash values, I will use the AWS listing/API variant that does, while keeping the "one broad remote inventory fetch per run" behavior intact.
