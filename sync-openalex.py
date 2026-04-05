@@ -5,6 +5,10 @@
 # 0.1.0 - 2026-03-31: 165f5372ff3c451aabc43033d57a73178dc6393e
 # 0.2.0 - 2026-04-05: we own partitions, freeze them on full download
 # 0.2.1 - 2026-04-05: trust aws sync on checksum, we only do a quick check
+# 0.2.2 - 2026-04-05:
+# - changed: manifest check per entity
+# - added: backup tarball sync progress
+# - added: prompt rename to *.delete if missing remote partition
 
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -114,30 +119,41 @@ def parse_args(argv: Sequence[str]) -> Config:
 def main(argv: Sequence[str]) -> int:
     config = parse_args(argv)
 
-    print_status("Verifying manifests.")
-    results = verify_or_initialize_manifests(config)
-    print_manifest_summary(results)
-
     if config.progress_path.exists():
+        create_progress_backup(config.progress_path)
         print_status(f"Loading progress file: {config.progress_path}")
     else:
         print_status(
             f"Initializing new progress file: {config.progress_path}"
         )
     progress = load_progress(config.progress_path)
-    download_status = build_download_status(
-        config=config,
-        existing_download_status=progress.get("download_status", {}),
-    )
-    progress["download_status"] = download_status
-    save_progress(config.progress_path, progress)
-    print_status(f"Saved progress snapshot: {config.progress_path}")
+    download_status = progress.get("download_status")
+    if not isinstance(download_status, dict):
+        raise ScriptError(
+            "Progress file key 'download_status' must contain a JSON object."
+        )
 
-    print_status("Checking for pending partitions to sync.")
-    sync_pending_partitions(
-        config=config,
-        progress=progress,
-    )
+    for entity in ENTITIES:
+        print_status(f"Processing {entity.name}.")
+        result = verify_or_initialize_manifest(config, entity)
+        print_manifest_summary((result,))
+
+        entity_download_status = build_download_status(
+            config=config,
+            existing_download_status=download_status,
+            entities=(entity,),
+        )
+        download_status.update(entity_download_status)
+        progress["download_status"] = download_status
+        save_progress(config.progress_path, progress)
+        print_status(f"Saved progress snapshot: {config.progress_path}")
+
+        print_status(f"Checking for pending partitions to sync for {entity.name}.")
+        sync_pending_partitions(
+            config=config,
+            progress=progress,
+            entities=(entity,),
+        )
 
     print("All partition syncs completed.")
     return 0
@@ -147,64 +163,66 @@ def verify_or_initialize_manifests(config: Config) -> list[ManifestCheckResult]:
     results: list[ManifestCheckResult] = []
 
     for entity in ENTITIES:
-        local_dir = config.local_root / entity.key
-        local_manifest = local_dir / "manifest"
-        remote_manifest_uri = remote_manifest_uri_for(config, entity)
-
-        if local_manifest.is_file():
-            remote_sha256 = download_and_hash_remote_manifest(
-                config=config,
-                remote_manifest_uri=remote_manifest_uri,
-            )
-            local_sha256 = sha256_file(local_manifest)
-            if local_sha256 != remote_sha256:
-                raise ScriptError(
-                    "Manifest checksum mismatch for "
-                    f"{entity.name} ({entity.key}).\n"
-                    f"Local manifest:  {local_manifest}\n"
-                    f"Local sha256:    {local_sha256}\n"
-                    f"Remote sha256:   {remote_sha256}"
-                )
-
-            results.append(
-                ManifestCheckResult(
-                    entity=entity,
-                    local_manifest=local_manifest,
-                    local_sha256=local_sha256,
-                    remote_sha256=remote_sha256,
-                    downloaded_manifest=False,
-                )
-            )
-            continue
-
-        if not is_directory_empty(local_dir):
-            raise ScriptError(
-                "Manifest does not exist for non-empty directory "
-                f"{local_dir}. Expected file: {local_manifest}"
-            )
-
-        local_dir.mkdir(parents=True, exist_ok=True)
-        download_s3_object(
-            config=config,
-            s3_uri=remote_manifest_uri,
-            destination=local_manifest,
-        )
-        remote_sha256 = sha256_file(local_manifest)
-        print(
-            f"Downloaded missing manifest for {entity.name} to {local_manifest}",
-            file=sys.stderr,
-        )
-        results.append(
-            ManifestCheckResult(
-                entity=entity,
-                local_manifest=local_manifest,
-                local_sha256=None,
-                remote_sha256=remote_sha256,
-                downloaded_manifest=True,
-            )
-        )
+        results.append(verify_or_initialize_manifest(config, entity))
 
     return results
+
+
+def verify_or_initialize_manifest(
+    config: Config,
+    entity: Entity,
+) -> ManifestCheckResult:
+    local_dir = config.local_root / entity.key
+    local_manifest = local_dir / "manifest"
+    remote_manifest_uri = remote_manifest_uri_for(config, entity)
+
+    if local_manifest.is_file():
+        remote_sha256 = download_and_hash_remote_manifest(
+            config=config,
+            remote_manifest_uri=remote_manifest_uri,
+        )
+        local_sha256 = sha256_file(local_manifest)
+        if local_sha256 != remote_sha256:
+            raise ScriptError(
+                "Manifest checksum mismatch for "
+                f"{entity.name} ({entity.key}).\n"
+                f"Local manifest:  {local_manifest}\n"
+                f"Local sha256:    {local_sha256}\n"
+                f"Remote sha256:   {remote_sha256}"
+            )
+
+        return ManifestCheckResult(
+            entity=entity,
+            local_manifest=local_manifest,
+            local_sha256=local_sha256,
+            remote_sha256=remote_sha256,
+            downloaded_manifest=False,
+        )
+
+    if not is_directory_empty(local_dir):
+        raise ScriptError(
+            "Manifest does not exist for non-empty directory "
+            f"{local_dir}. Expected file: {local_manifest}"
+        )
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    download_s3_object(
+        config=config,
+        s3_uri=remote_manifest_uri,
+        destination=local_manifest,
+    )
+    remote_sha256 = sha256_file(local_manifest)
+    print(
+        f"Downloaded missing manifest for {entity.name} to {local_manifest}",
+        file=sys.stderr,
+    )
+    return ManifestCheckResult(
+        entity=entity,
+        local_manifest=local_manifest,
+        local_sha256=None,
+        remote_sha256=remote_sha256,
+        downloaded_manifest=True,
+    )
 
 
 def print_manifest_summary(results: Sequence[ManifestCheckResult]) -> None:
@@ -223,6 +241,71 @@ def print_manifest_summary(results: Sequence[ManifestCheckResult]) -> None:
 
 def print_status(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def create_progress_backup(path: Path) -> None:
+    backup_path = progress_backup_path(path)
+    if backup_path.exists():
+        if not prompt_overwrite_backup(backup_path):
+            print_status(f"Keeping existing progress backup: {backup_path}")
+            return
+
+    print_status(f"Creating progress backup: {backup_path}")
+    try:
+        with tarfile.open(backup_path, "w:gz") as archive:
+            archive.add(path, arcname=path.name)
+    except OSError as exc:
+        raise ScriptError(f"Failed to create progress backup: {backup_path}") from exc
+
+
+def progress_backup_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.tar.gz")
+
+
+def prompt_overwrite_backup(path: Path) -> bool:
+    while True:
+        print(
+            f"Backup already exists at {path}. Overwrite? [y/N]: ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            response = input()
+        except EOFError as exc:
+            raise ScriptError(
+                f"Could not read overwrite confirmation for backup: {path}"
+            ) from exc
+
+        normalized = response.strip().lower()
+        if normalized in {"", "n", "no"}:
+            return False
+        if normalized in {"y", "yes"}:
+            return True
+        print_status("Please answer y or n.")
+
+
+def prompt_rename_partition_to_delete(path: Path) -> bool:
+    while True:
+        print(
+            f"Rename local partition to {path.name}.delete and continue? [y/N]: ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            response = input()
+        except EOFError as exc:
+            raise ScriptError(
+                "Could not read confirmation for renaming a stale local partition."
+            ) from exc
+
+        normalized = response.strip().lower()
+        if normalized in {"", "n", "no"}:
+            return False
+        if normalized in {"y", "yes"}:
+            return True
+        print_status("Please answer y or n.")
 
 
 def load_progress(path: Path) -> dict[str, Any]:
@@ -267,6 +350,7 @@ def build_download_status(
     *,
     config: Config,
     existing_download_status: Any,
+    entities: Sequence[Entity] = ENTITIES,
 ) -> dict[str, Any]:
     if existing_download_status is None:
         existing_download_status = {}
@@ -275,14 +359,35 @@ def build_download_status(
             "Progress file key 'download_status' must contain a JSON object."
         )
 
-    print_status(f"Scanning local inventory under {config.local_root}")
-    local_inventory, local_last_fetched = scan_local_inventory(config)
+    entity_list = tuple(entities)
+    if len(entity_list) == 1:
+        entity = entity_list[0]
+        print_status(
+            f"Scanning local inventory for {entity.name} under "
+            f"{config.local_root / entity.key}"
+        )
+    else:
+        print_status(f"Scanning local inventory under {config.local_root}")
+    local_inventory, local_last_fetched = scan_local_inventory(
+        config,
+        entities=entity_list,
+    )
     print_status(
         "Finished local inventory scan: "
         f"{count_partitions(local_inventory)} partitions"
     )
-    print_status(f"Scanning remote inventory under {config.remote_root}")
-    remote_inventory, remote_last_fetched = scan_remote_inventory(config)
+    if len(entity_list) == 1:
+        entity = entity_list[0]
+        print_status(
+            f"Scanning remote inventory for {entity.name} under "
+            f"{remote_entity_uri_for(config, entity)}"
+        )
+    else:
+        print_status(f"Scanning remote inventory under {config.remote_root}")
+    remote_inventory, remote_last_fetched = scan_remote_inventory(
+        config,
+        entities=entity_list,
+    )
     print_status(
         "Finished remote inventory scan: "
         f"{count_partitions(remote_inventory)} partitions"
@@ -291,7 +396,7 @@ def build_download_status(
     remote_last_calculated = iso_timestamp_now()
 
     download_status: dict[str, Any] = {}
-    for entity in ENTITIES:
+    for entity in entity_list:
         existing_entity = existing_download_status.get(entity.key, {})
         download_status[entity.key] = {
             "local": build_local_entity_status(
@@ -313,12 +418,15 @@ def build_download_status(
 
 def scan_local_inventory(
     config: Config,
+    *,
+    entities: Sequence[Entity] = ENTITIES,
 ) -> tuple[dict[str, dict[str, dict[str, dict[str, Any]]]], str]:
+    entity_list = tuple(entities)
     inventory: dict[str, dict[str, dict[str, dict[str, Any]]]] = {
-        entity.key: {} for entity in ENTITIES
+        entity.key: {} for entity in entity_list
     }
 
-    for entity in ENTITIES:
+    for entity in entity_list:
         entity_dir = config.local_root / entity.key
         if not entity_dir.exists():
             continue
@@ -344,22 +452,49 @@ def scan_local_inventory(
 
 def scan_remote_inventory(
     config: Config,
+    *,
+    entities: Sequence[Entity] = ENTITIES,
 ) -> tuple[dict[str, dict[str, dict[str, dict[str, Any]]]], str]:
-    bucket, prefix = parse_s3_uri(config.remote_root)
+    entity_list = tuple(entities)
     inventory: dict[str, dict[str, dict[str, dict[str, Any]]]] = {
-        entity.key: {} for entity in ENTITIES
+        entity.key: {} for entity in entity_list
     }
 
+    if len(entity_list) == 1:
+        entity = entity_list[0]
+        bucket, prefix = parse_s3_uri(remote_entity_uri_for(config, entity))
+        for s3_object in iter_remote_objects(config=config, bucket=bucket, prefix=prefix):
+            key = s3_object.get("Key")
+            if not isinstance(key, str):
+                continue
+
+            parsed_entity_key = parse_entity_partition_object_key(
+                prefix=prefix,
+                key=key,
+            )
+            if parsed_entity_key is None:
+                continue
+
+            partition_key, filename = parsed_entity_key
+            metadata = dict(s3_object)
+            metadata["filename"] = filename
+            inventory[entity.key].setdefault(partition_key, {})[filename] = metadata
+        return inventory, iso_timestamp_now()
+
+    bucket, prefix = parse_s3_uri(config.remote_root)
+    selected_entity_keys = frozenset(entity.key for entity in entity_list)
     for s3_object in iter_remote_objects(config=config, bucket=bucket, prefix=prefix):
         key = s3_object.get("Key")
         if not isinstance(key, str):
             continue
 
-        parsed = parse_partition_object_key(prefix=prefix, key=key)
-        if parsed is None:
+        parsed_partition_key = parse_partition_object_key(prefix=prefix, key=key)
+        if parsed_partition_key is None:
             continue
 
-        entity_key, partition_key, filename = parsed
+        entity_key, partition_key, filename = parsed_partition_key
+        if entity_key not in selected_entity_keys:
+            continue
         metadata = dict(s3_object)
         metadata["filename"] = filename
 
@@ -520,6 +655,7 @@ def sync_pending_partitions(
     *,
     config: Config,
     progress: dict[str, Any],
+    entities: Sequence[Entity] = ENTITIES,
 ) -> None:
     download_status = progress.get("download_status")
     if not isinstance(download_status, dict):
@@ -529,7 +665,7 @@ def sync_pending_partitions(
 
     total_pending = 0
 
-    for entity in ENTITIES:
+    for entity in entities:
         entity_state = download_status.get(entity.key)
         if not isinstance(entity_state, dict):
             raise ScriptError(f"Missing progress entry for entity: {entity.key}")
@@ -590,10 +726,20 @@ def sync_pending_partitions(
                 )
             remote_partition_state = remote_partitions.get(partition_key)
             if not isinstance(remote_partition_state, dict):
-                raise ScriptError(
+                missing_partition_message = (
                     "Remote inventory missing partition for "
                     f"{entity.name} ({entity.key}) updated_date={partition_key}"
                 )
+                print_status(missing_partition_message)
+                if rename_local_partition_to_delete(
+                    config=config,
+                    progress=progress,
+                    entity=entity,
+                    partition_key=partition_key,
+                    local_state=local_state,
+                ):
+                    continue
+                raise ScriptError(missing_partition_message)
             remote_listing = remote_partition_state.get("listing")
             if not isinstance(remote_listing, dict):
                 raise ScriptError(
@@ -632,6 +778,52 @@ def sync_pending_partitions(
 
     if total_pending == 0:
         print_status("No pending partitions to sync.")
+
+
+def rename_local_partition_to_delete(
+    *,
+    config: Config,
+    progress: dict[str, Any],
+    entity: Entity,
+    partition_key: str,
+    local_state: dict[str, Any],
+) -> bool:
+    local_partition_path = (
+        config.local_root / entity.key / partition_directory_name(partition_key)
+    )
+    if not prompt_rename_partition_to_delete(local_partition_path):
+        return False
+
+    delete_path = local_partition_path.with_name(f"{local_partition_path.name}.delete")
+    if delete_path.exists():
+        raise ScriptError(
+            "Cannot rename local partition because target already exists: "
+            f"{delete_path}"
+        )
+    if not local_partition_path.exists():
+        raise ScriptError(
+            "Cannot rename local partition because source does not exist: "
+            f"{local_partition_path}"
+        )
+
+    try:
+        local_partition_path.rename(delete_path)
+    except OSError as exc:
+        raise ScriptError(
+            "Failed to rename local partition to .delete: "
+            f"{local_partition_path} -> {delete_path}"
+        ) from exc
+
+    local_partitions = local_state.get("partitions")
+    if not isinstance(local_partitions, dict):
+        raise ScriptError(f"Malformed local partition listing for entity: {entity.key}")
+    local_partitions.pop(partition_key, None)
+    recalculate_local_entity_summary(local_state, iso_timestamp_now())
+    save_progress(config.progress_path, progress)
+    print_status(
+        f"Renamed local partition to {delete_path.name} and continued."
+    )
+    return True
 
 
 def build_local_file_metadata(path: Path) -> dict[str, Any]:
@@ -723,6 +915,29 @@ def parse_partition_object_key(
         return None
 
     return entity_key, partition_name[len(PARTITION_PREFIX):], filename
+
+
+def parse_entity_partition_object_key(
+    *,
+    prefix: str,
+    key: str,
+) -> tuple[str, str] | None:
+    expected_prefix = f"{prefix}/" if prefix else ""
+    if expected_prefix and not key.startswith(expected_prefix):
+        return None
+
+    relative_key = key[len(expected_prefix):] if expected_prefix else key
+    parts = relative_key.split("/")
+    if len(parts) != 2:
+        return None
+
+    partition_name, filename = parts
+    if not partition_name.startswith(PARTITION_PREFIX):
+        return None
+    if not filename:
+        return None
+
+    return partition_name[len(PARTITION_PREFIX):], filename
 
 
 def run_json_command(args: Sequence[str]) -> dict[str, Any]:
