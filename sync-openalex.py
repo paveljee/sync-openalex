@@ -4,20 +4,18 @@
 # via chatgpt.com on 2026-03-30; prompt lost
 # 0.1.0 - 2026-03-31: 165f5372ff3c451aabc43033d57a73178dc6393e
 # 0.2.0 - 2026-04-05: we own partitions, freeze them on full download
+# 0.2.1 - 2026-04-05: trust aws sync on checksum, we only do a quick check
 
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import shlex
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
-import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,12 +28,6 @@ DEFAULT_PROGRESS_PATH: Final[Path] = Path("./sync_progress.json")
 DEFAULT_AWS_BIN: Final[str] = shutil.which("aws") or "aws"
 PARTITION_TYPE: Final[str] = "updated_date"
 PARTITION_PREFIX: Final[str] = f"{PARTITION_TYPE}="
-SUPPORTED_HASH_KEYS: Final[tuple[str, ...]] = (
-    "ChecksumSHA256",
-    "ChecksumSHA1",
-    "ChecksumCRC32",
-    "ETag",
-)
 
 
 class ScriptError(Exception):
@@ -122,9 +114,16 @@ def parse_args(argv: Sequence[str]) -> Config:
 def main(argv: Sequence[str]) -> int:
     config = parse_args(argv)
 
+    print_status("Verifying manifests.")
     results = verify_or_initialize_manifests(config)
     print_manifest_summary(results)
 
+    if config.progress_path.exists():
+        print_status(f"Loading progress file: {config.progress_path}")
+    else:
+        print_status(
+            f"Initializing new progress file: {config.progress_path}"
+        )
     progress = load_progress(config.progress_path)
     download_status = build_download_status(
         config=config,
@@ -132,7 +131,9 @@ def main(argv: Sequence[str]) -> int:
     )
     progress["download_status"] = download_status
     save_progress(config.progress_path, progress)
+    print_status(f"Saved progress snapshot: {config.progress_path}")
 
+    print_status("Checking for pending partitions to sync.")
     sync_pending_partitions(
         config=config,
         progress=progress,
@@ -220,6 +221,10 @@ def print_manifest_summary(results: Sequence[ManifestCheckResult]) -> None:
             )
 
 
+def print_status(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def load_progress(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"download_status": {}}
@@ -270,8 +275,18 @@ def build_download_status(
             "Progress file key 'download_status' must contain a JSON object."
         )
 
+    print_status(f"Scanning local inventory under {config.local_root}")
     local_inventory, local_last_fetched = scan_local_inventory(config)
+    print_status(
+        "Finished local inventory scan: "
+        f"{count_partitions(local_inventory)} partitions"
+    )
+    print_status(f"Scanning remote inventory under {config.remote_root}")
     remote_inventory, remote_last_fetched = scan_remote_inventory(config)
+    print_status(
+        "Finished remote inventory scan: "
+        f"{count_partitions(remote_inventory)} partitions"
+    )
     local_last_calculated = iso_timestamp_now()
     remote_last_calculated = iso_timestamp_now()
 
@@ -347,16 +362,6 @@ def scan_remote_inventory(
         entity_key, partition_key, filename = parsed
         metadata = dict(s3_object)
         metadata["filename"] = filename
-
-        head_metadata = fetch_remote_object_metadata(
-            config=config,
-            bucket=bucket,
-            key=key,
-        )
-        for metadata_key, metadata_value in head_metadata.items():
-            if metadata_key == "ResponseMetadata":
-                continue
-            metadata[metadata_key] = metadata_value
 
         inventory[entity_key].setdefault(partition_key, {})[filename] = metadata
 
@@ -505,6 +510,12 @@ def ordered_listing(
     return {filename: listing[filename] for filename in sorted(listing)}
 
 
+def count_partitions(
+    inventory: dict[str, dict[str, dict[str, dict[str, Any]]]],
+) -> int:
+    return sum(len(partitions) for partitions in inventory.values())
+
+
 def sync_pending_partitions(
     *,
     config: Config,
@@ -515,6 +526,8 @@ def sync_pending_partitions(
         raise ScriptError(
             "Progress file key 'download_status' must contain a JSON object."
         )
+
+    total_pending = 0
 
     for entity in ENTITIES:
         entity_state = download_status.get(entity.key)
@@ -531,6 +544,9 @@ def sync_pending_partitions(
         if not isinstance(local_partitions, dict) or not isinstance(remote_partitions, dict):
             raise ScriptError(f"Malformed partition listing for entity: {entity.key}")
 
+        pending_partition_keys: list[str] = []
+        frozen_partition_count = 0
+
         for partition_key in sorted(local_partitions):
             partition_state = local_partitions[partition_key]
             if not isinstance(partition_state, dict):
@@ -544,8 +560,34 @@ def sync_pending_partitions(
                 )
 
             if partition_summary.get("fully_downloaded"):
+                frozen_partition_count += 1
                 continue
+            pending_partition_keys.append(partition_key)
 
+        if pending_partition_keys:
+            print_status(
+                f"{entity.name}: {len(pending_partition_keys)} pending partitions, "
+                f"{frozen_partition_count} frozen partitions."
+            )
+        else:
+            print_status(
+                f"{entity.name}: no pending partitions "
+                f"({frozen_partition_count} frozen partitions)."
+            )
+
+        total_pending += len(pending_partition_keys)
+
+        for partition_key in pending_partition_keys:
+            partition_state = local_partitions[partition_key]
+            if not isinstance(partition_state, dict):
+                raise ScriptError(
+                    f"Malformed local partition entry for {entity.key} {partition_key}"
+                )
+            partition_summary = partition_state.get("summary")
+            if not isinstance(partition_summary, dict):
+                raise ScriptError(
+                    f"Malformed local partition summary for {entity.key} {partition_key}"
+                )
             remote_partition_state = remote_partitions.get(partition_key)
             if not isinstance(remote_partition_state, dict):
                 raise ScriptError(
@@ -583,35 +625,21 @@ def sync_pending_partitions(
             partition_summary["last_calculated"] = last_calculated
             recalculate_local_entity_summary(local_state, last_calculated)
             save_progress(config.progress_path, progress)
+            print_status(
+                f"Verified {entity.name} updated_date={partition_key} "
+                "and marked it fully downloaded."
+            )
+
+    if total_pending == 0:
+        print_status("No pending partitions to sync.")
 
 
 def build_local_file_metadata(path: Path) -> dict[str, Any]:
-    md5_digest = hashlib.md5()
-    sha1_digest = hashlib.sha1()
-    sha256_digest = hashlib.sha256()
-    crc32_value = 0
-
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            md5_digest.update(chunk)
-            sha1_digest.update(chunk)
-            sha256_digest.update(chunk)
-            crc32_value = zlib.crc32(chunk, crc32_value)
-
     stat_result = path.stat()
     return {
         "filename": path.name,
         "LastModified": iso_from_unix_timestamp(stat_result.st_mtime),
         "Size": stat_result.st_size,
-        "ETag": f"\"{md5_digest.hexdigest()}\"",
-        "ChecksumSHA1": encode_digest_base64(sha1_digest.digest()),
-        "ChecksumSHA256": encode_digest_base64(sha256_digest.digest()),
-        "ChecksumCRC32": encode_digest_base64(
-            struct.pack(">I", crc32_value & 0xFFFFFFFF)
-        ),
     }
 
 
@@ -670,30 +698,6 @@ def iter_remote_objects(
             raise ScriptError(
                 "Unexpected list-objects-v2 response: missing continuation token."
             )
-
-
-def fetch_remote_object_metadata(
-    *,
-    config: Config,
-    bucket: str,
-    key: str,
-) -> dict[str, Any]:
-    return run_json_command(
-        [
-            config.aws_bin,
-            "s3api",
-            "head-object",
-            "--bucket",
-            bucket,
-            "--key",
-            key,
-            "--output",
-            "json",
-            "--no-sign-request",
-            "--checksum-mode",
-            "ENABLED",
-        ]
-    )
 
 
 def parse_partition_object_key(
@@ -803,18 +807,20 @@ def verify_partition_integrity(
             mismatches.append(f"{filename}: malformed metadata entry")
             continue
 
-        comparable_hash = select_comparable_hash(
+        metadata_comparison = select_comparable_metadata(
             remote_metadata=remote_metadata,
             local_metadata=local_metadata,
         )
-        if comparable_hash is None:
-            mismatches.append(f"{filename}: no comparable hash metadata available")
+        if metadata_comparison is None:
+            mismatches.append(
+                f"{filename}: missing comparable LastModified or Size metadata"
+            )
             continue
 
-        hash_key, remote_value, local_value = comparable_hash
+        metadata_key, remote_value, local_value = metadata_comparison
         if remote_value != local_value:
             mismatches.append(
-                f"{filename}: {hash_key} mismatch "
+                f"{filename}: {metadata_key} mismatch "
                 f"(remote={remote_value!r}, local={local_value!r})"
             )
 
@@ -838,40 +844,63 @@ def verify_partition_integrity(
         raise ScriptError("\n".join(details))
 
 
-def select_comparable_hash(
+def select_comparable_metadata(
     *,
     remote_metadata: dict[str, Any],
     local_metadata: dict[str, Any],
 ) -> tuple[str, str, str] | None:
-    checksum_type = remote_metadata.get("ChecksumType")
-    for hash_key in SUPPORTED_HASH_KEYS:
-        if hash_key != "ETag" and checksum_type == "COMPOSITE":
-            continue
+    comparable_pairs = (
+        (
+            "Size",
+            normalize_size_metadata(remote_metadata.get("Size")),
+            normalize_size_metadata(local_metadata.get("Size")),
+        ),
+        (
+            "LastModified",
+            normalize_timestamp_metadata(remote_metadata.get("LastModified")),
+            normalize_timestamp_metadata(local_metadata.get("LastModified")),
+        ),
+    )
 
-        remote_value = remote_metadata.get(hash_key)
-        local_value = local_metadata.get(hash_key)
-        if not isinstance(remote_value, str) or not isinstance(local_value, str):
-            continue
-        if not remote_value or not local_value:
-            continue
+    for metadata_key, remote_value, local_value in comparable_pairs:
+        if remote_value is None or local_value is None:
+            return None
+        if remote_value != local_value:
+            return metadata_key, remote_value, local_value
 
-        if hash_key == "ETag":
-            normalized_remote = normalize_etag(remote_value)
-            normalized_local = normalize_etag(local_value)
-            if normalized_remote is None or normalized_local is None:
-                continue
-            if "-" in normalized_remote:
-                continue
-            return hash_key, normalized_remote, normalized_local
+    return "verified", "ok", "ok"
 
-        return hash_key, remote_value, local_value
 
+def normalize_size_metadata(value: Any) -> str | None:
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
     return None
 
 
-def normalize_etag(value: str) -> str | None:
-    stripped = value.strip().strip("\"")
-    return stripped or None
+def normalize_timestamp_metadata(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip()
+    if not normalized:
+        return None
+
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return normalized
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return str(int(parsed.astimezone(timezone.utc).timestamp()))
 
 
 def partition_directory_name(partition_key: str) -> str:
@@ -898,10 +927,6 @@ def iso_from_unix_timestamp(timestamp: float) -> str:
         "+00:00",
         "Z",
     )
-
-
-def encode_digest_base64(digest: bytes) -> str:
-    return base64.b64encode(digest).decode("ascii")
 
 
 def sync_entity(config: Config, entity: Entity) -> None:

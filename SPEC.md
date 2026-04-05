@@ -188,7 +188,7 @@ This is how I currently understand the requested change.
 - Preserve the current manifest-first behavior unchanged, and replace the later whole-entity sync flow with a progress-file-driven, partition-by-partition sync flow.
 - The hardcoded entity list remains the owned inventory of entities and also defines output ordering.
 - The script should now own the inventory of partitions in `sync_progress.json`, while keeping already completed older partitions intact and only syncing partitions that are not yet marked complete.
-- The correctness gate for the sync stage is no longer "manifest matches, then sync the whole entity"; it is now "one partition sync completes, then that partition passes our own integrity check against the remote inventory captured for this run".
+- The correctness gate for the sync stage is no longer "manifest matches, then sync the whole entity"; it is now "one partition sync completes with `aws s3 sync --checksum-mode ENABLED`, then that partition passes our own descriptive check against the remote inventory captured for this run".
 
 2. Progress file shape
 - Add a progress file path, defaulting to `Path("./sync_progress.json")`.
@@ -228,13 +228,13 @@ This is how I currently understand the requested change.
 - the AWS-provided hash / checksum field
 - Any other metadata returned by AWS for that file should also be preserved in the same flat dict.
 - Use the key names offered by AWS for those metadata fields.
-- For local files, use the same comparable key names where possible, with the local hash calculated by the script so it can be compared directly with the remote hash field.
+- For local files, do not calculate any hashes in the script; the local listing only needs the metadata required for the descriptive snapshot and the later last-modified and size comparison.
 
 5. Meaning of `fully_downloaded`
 - Partition level:
 - Default is `false`.
 - It becomes `true` only after a partition-scoped sync finishes and that exact partition passes integrity verification during the same run.
-- The integrity rule is strict: the remote and local partition must have the same number of part files, and every expected part file must have the same hash on both sides.
+- The integrity rule is strict: the remote and local partition must have the same number of part files, and every expected part file must have the same last modified date and file size on both sides.
 - When that passes, set `timestamp_fully_downloaded` to the partition's current `last_calculated`.
 - After that, the partition is frozen: future runs keep its stored `fully_downloaded=true` state and do not sync it again.
 - This frozen behavior is intentional even if the current remote listing for that older partition later changes, because the spec explicitly wants older partitions kept intact locally.
@@ -270,4 +270,4 @@ This is how I currently understand the requested change.
 9. Assumptions I am making from the spec before implementation
 - The existing manifest download and manifest checksum workflow remains in the main control flow and must be preserved unchanged before the later sync work starts.
 - Scanning should ignore entity directories that are not in the hardcoded entity list, because the entity inventory is explicitly owned by that list.
-- The single broad remote fetch must provide enough metadata to populate the remote listing and later compare hashes. If plain `aws s3 ls` cannot supply hash values, I will use the AWS listing/API variant that does, while keeping the "one broad remote inventory fetch per run" behavior intact.
+- The single broad remote fetch must provide enough metadata to populate the remote listing and later compare last modified date and file size. Any AWS checksum metadata it exposes is descriptive only, because transfer integrity is being trusted to `aws s3 sync --checksum-mode ENABLED`.
