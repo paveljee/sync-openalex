@@ -184,10 +184,10 @@ under sandboxed lima.
 This is how I currently understand the requested change.
 
 1. High-level behavior change
-- Replace the current manifest-first, whole-entity sync flow with a progress-file-driven, partition-by-partition sync flow.
+- Preserve the current manifest-first behavior unchanged, and replace the later whole-entity sync flow with a progress-file-driven, partition-by-partition sync flow.
 - The hardcoded entity list remains the owned inventory of entities and also defines output ordering.
 - The script should now own the inventory of partitions in `sync_progress.json`, while keeping already completed older partitions intact and only syncing partitions that are not yet marked complete.
-- The correctness gate is no longer "manifest matches, then sync the whole entity"; it is now "one partition sync completes, then that partition passes our own integrity check against the remote inventory captured for this run".
+- The correctness gate for the sync stage is no longer "manifest matches, then sync the whole entity"; it is now "one partition sync completes, then that partition passes our own integrity check against the remote inventory captured for this run".
 
 2. Progress file shape
 - Add a progress file path, defaulting to `Path("./sync_progress.json")`.
@@ -205,6 +205,8 @@ This is how I currently understand the requested change.
 ```
 
 - Entity keys in `download_status` must follow the hardcoded entity order.
+- Entity summaries include both `last_fetched` and `last_calculated`.
+- Partition summaries include `last_calculated`.
 - `partition_type` is always the literal string `"updated_date"`.
 - My interpretation is that partition keys inside `partitions` should be the bare date value, for example `2024-01-15`, because `partition_type` already stores the `"updated_date"` label.
 - My interpretation is that `listing` should be an ordered mapping keyed by filename, with each value being the flat metadata dict for that file and also including `filename` inside the dict.
@@ -214,16 +216,18 @@ This is how I currently understand the requested change.
 - Then do a full local scan under `DEFAULT_LOCAL_ROOT`, limited to the hardcoded entities, and rebuild the `local` tree from disk.
 - Then do one broad remote inventory fetch under `DEFAULT_REMOTE_ROOT` and rebuild the `remote` tree from that fetch.
 - Both local and remote summaries are descriptive snapshots of what was seen during the current run.
+- `last_fetched` must be the ISO timestamp for when the raw local scan or broad remote listing happened, and it must precede `last_calculated`.
 - `last_calculated` must be an accurate ISO timestamp for when the corresponding inventory snapshot was computed.
 - The remote tree mirrors the local tree structurally, except remote does not use `fully_downloaded` or `timestamp_fully_downloaded`.
 
 4. Per-file metadata
 - Each file entry must contain at least:
 - `filename`
-- `last_modified`
-- `hash_sum`
+- the AWS-provided last modified field
+- the AWS-provided hash / checksum field
 - Any other metadata returned by AWS for that file should also be preserved in the same flat dict.
-- For local files, use the same normalized metadata shape where possible, with the local hash calculated by the script so it can be compared directly with the remote hash field.
+- Use the key names offered by AWS for those metadata fields.
+- For local files, use the same comparable key names where possible, with the local hash calculated by the script so it can be compared directly with the remote hash field.
 
 5. Meaning of `fully_downloaded`
 - Partition level:
@@ -263,7 +267,6 @@ This is how I currently understand the requested change.
 - Therefore a partition is either fully verified and marked within one run, or it is left unmarked.
 
 9. Assumptions I am making from the spec before implementation
-- The existing manifest download and manifest checksum workflow is removed from the main control flow. It is not mentioned in the new progress format and is no longer the thing that gates syncing.
+- The existing manifest download and manifest checksum workflow remains in the main control flow and must be preserved unchanged before the later sync work starts.
 - Scanning should ignore entity directories that are not in the hardcoded entity list, because the entity inventory is explicitly owned by that list.
-- Even though the structure bullets only show `last_calculated` at the entity summary level, I am interpreting partition summaries as also needing `last_calculated`, because the spec says partition `timestamp_fully_downloaded` should be set to the current `last_calculated`.
 - The single broad remote fetch must provide enough metadata to populate the remote listing and later compare hashes. If plain `aws s3 ls` cannot supply hash values, I will use the AWS listing/API variant that does, while keeping the "one broad remote inventory fetch per run" behavior intact.
