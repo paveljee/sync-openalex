@@ -2,6 +2,7 @@
 
 # originally generated using ChatGPT 5.4 Extended thinking
 # via chatgpt.com on 2026-03-30; prompt lost
+# Later updated manually, but mostly using Codex etc. - see SPEC.md
 # 0.1.0 - 2026-03-31: 165f5372ff3c451aabc43033d57a73178dc6393e
 # 0.2.0 - 2026-04-05: we own partitions, freeze them on full download
 # 0.2.1 - 2026-04-05: trust aws sync on checksum, we only do a quick check
@@ -9,6 +10,7 @@
 # - changed: manifest check per entity
 # - added: backup tarball sync progress
 # - added: prompt rename to *.delete if missing remote partition
+# 0.2.3 - 2026-04-05: first public release
 
 from __future__ import annotations
 
