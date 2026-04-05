@@ -16,12 +16,12 @@
 > [Snapshot data format][openalex-snapshot-format] and
 > [Download to your machine][openalex-download-to-machine].
 >
-> Has no external dependencies,
+> Has no external dependencies
+> except [AWS CLI][aws-cli];
 > Python stdlib only
 > (tested on 3.12.9).
 >
-> Run it with `python sync-openalex.py`
-> (assumes that [AWS CLI][aws-cli] is installed).
+> Run it with `python sync-openalex.py`.
 >
 > Type-check and lint with `make`
 > (assumes `mypy` and `ruff` are installed).
@@ -41,7 +41,7 @@
 > in `./sync_progress.json`
 > - freezes partitions once they are fully downloaded
 > - creates a `sync_progress.json.tar.gz` backup before reuse
-> - can prompt to rename stale local-only partitions
+> - prompts to rename stale local-only partitions
 > to `.delete`
 > when the remote side no longer has them
 >
