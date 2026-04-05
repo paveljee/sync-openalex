@@ -85,6 +85,7 @@ the file's structure:
         - total_files [meaning total files across all partitions]
         - fully_downloaded
         - timestamp_fully_downloaded
+        - last_fetched
         - last_calculated
       - partitions
         - [for each updated_date as key, sorted from older to latest]
@@ -92,9 +93,10 @@ the file's structure:
             - total_part_files
             - fully_downloaded
             - timestamp_fully_downloaded
+            - last_calculated
           - listing
             - [for each part file, sorted from min to max]
-              - [here goes flat dict of any metadata aws offers for the from the file listing, but must include filename, last modified date, and hash sum, but also include anything else it offers]
+              - [here goes flat dict of any metadata aws offers for the from the file listing, but must include filename, last modified date, and hash sum, but also include anything else it offers; use key names offered by aws]
     - remote
       - [here goes same tree as for local, except fully_downloaded and timestamp_fully_downloaded keys are not used]
 
@@ -102,6 +104,8 @@ how this all works:
 the script does global search in DEFAULT_LOCAL_ROOT and updates local dict.
 keys are self explanatory above except that
 last_calculated means iso timestamp when summary last recalculated and must be accurate;
+last_fetched means when local global search or remote aws ls was done,
+as such last_fetched always preceded last_calculated;
 fully_downloaded is boolean and set to false by default and will only be set to true if conditions are met - see below;
 timestamp_fully_downloaded means when conditions were met for fully_downloaded;
 so, script does global search in local dir and updates local dict.
@@ -157,6 +161,9 @@ therefore keep sync_progress.json purely descriptive.
 yet we will not do that and will do our own checks to be sure.
 so we only tick fully_downloaded when we see that the actually downloaded files
 match what we expected to get from this partition based on the aws ls fetch we pre-run.
+
+of note, existing manifest checking behaviour still preceds all ops described in this spec and
+as such, must be fully preserved unchanged.
 
 asking ai below to interpret.
 using:
