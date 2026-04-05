@@ -156,11 +156,12 @@ args we use for partition level aws sync:
 
 there is _no global level aws sync_ happening therefore in this spec.
 
-in fact, we might have opted for trusting aws sync on checksums, and
+in fact, we will have to opt for trusting aws sync on checksums, and
 therefore keep sync_progress.json purely descriptive.
-yet we will not do that and will do our own checks to be sure.
-so we only tick fully_downloaded when we see that the actually downloaded files
-match what we expected to get from this partition based on the aws ls fetch we pre-run.
+so we don't calculate any hash sums on your own
+because it's taking too long.
+so, we trust aws sync to do its checksum mode and
+we just verify that last modified date and file size are identical.
 
 of note, existing manifest checking behaviour still preceds all ops described in this spec and
 as such, must be fully preserved unchanged.
