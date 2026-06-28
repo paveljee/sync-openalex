@@ -1,12 +1,19 @@
 # sync-openalex
 
 **[paveljee][github-paveljee]**
-**commented on**
-**Apr 5, 2026**
+commented on
+Apr 5, 2026
+•
+edited on
+Jun 28, 2026
+(most recent)
 
 > `sync-openalex.py`
-> incrementally mirrors the OpenAlex snapshot
-> into `./openalex/data`.
+> incrementally mirrors the
+> free quarterly
+> OpenAlex snapshot
+> in JSON Lines format
+> into `./openalex/data/jsonl`.
 >
 > For example,
 > I have been using this with a 8 TB HDD with no issues.

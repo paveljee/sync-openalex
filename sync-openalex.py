@@ -11,6 +11,9 @@
 # - added: backup tarball sync progress
 # - added: prompt rename to *.delete if missing remote partition
 # 0.2.3 - 2026-04-05: first public release
+# 0.2.4 - 2026-06-27:
+# - changed: adapted to new jsonl/parquet and manifest format
+# - added: 10 new entities from awards, continents to work types.
 
 from __future__ import annotations
 
@@ -29,12 +32,13 @@ from pathlib import Path
 from typing import Any, Final, Sequence
 
 
-DEFAULT_REMOTE_ROOT: Final[str] = "s3://openalex/data"
-DEFAULT_LOCAL_ROOT: Final[Path] = Path("./openalex/data")
+DEFAULT_REMOTE_ROOT: Final[str] = "s3://openalex/data/jsonl"
+DEFAULT_LOCAL_ROOT: Final[Path] = Path("./openalex/data/jsonl")
 DEFAULT_PROGRESS_PATH: Final[Path] = Path("./sync_progress.json")
 DEFAULT_AWS_BIN: Final[str] = shutil.which("aws") or "aws"
 PARTITION_TYPE: Final[str] = "updated_date"
 PARTITION_PREFIX: Final[str] = f"{PARTITION_TYPE}="
+MANIFEST_FILENAME: Final[str] = "manifest.json"
 
 
 class ScriptError(Exception):
@@ -59,6 +63,16 @@ ENTITIES: Final[tuple[Entity, ...]] = (
     Entity(name="Publishers", key="publishers"),
     Entity(name="Funders", key="funders"),
     Entity(name="Concepts", key="concepts"),
+    Entity(name="Awards", key="awards"),
+    Entity(name="Continents", key="continents"),
+    Entity(name="Countries", key="countries"),
+    Entity(name="Institution types", key="institution-types"),
+    Entity(name="Keywords", key="keywords"),
+    Entity(name="Languages", key="languages"),
+    Entity(name="Licenses", key="licenses"),
+    Entity(name="SDGs", key="sdgs"),
+    Entity(name="Source types", key="source-types"),
+    Entity(name="Work types", key="work-types"),
 )
 ENTITY_KEYS: Final[frozenset[str]] = frozenset(entity.key for entity in ENTITIES)
 
@@ -175,7 +189,7 @@ def verify_or_initialize_manifest(
     entity: Entity,
 ) -> ManifestCheckResult:
     local_dir = config.local_root / entity.key
-    local_manifest = local_dir / "manifest"
+    local_manifest = local_dir / MANIFEST_FILENAME
     remote_manifest_uri = remote_manifest_uri_for(config, entity)
 
     if local_manifest.is_file():
@@ -1174,12 +1188,12 @@ def remote_entity_uri_for(config: Config, entity: Entity) -> str:
 
 
 def remote_manifest_uri_for(config: Config, entity: Entity) -> str:
-    return f"{remote_entity_uri_for(config, entity)}/manifest"
+    return f"{remote_entity_uri_for(config, entity)}/{MANIFEST_FILENAME}"
 
 
 def download_and_hash_remote_manifest(config: Config, remote_manifest_uri: str) -> str:
     with tempfile.TemporaryDirectory(prefix="openalex-manifest-") as tmp_dir_str:
-        temp_path = Path(tmp_dir_str) / "manifest"
+        temp_path = Path(tmp_dir_str) / MANIFEST_FILENAME
         download_s3_object(
             config=config,
             s3_uri=remote_manifest_uri,
